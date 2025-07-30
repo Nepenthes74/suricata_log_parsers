@@ -2,7 +2,7 @@
 
 #
 # This script continuously cross-references active network connections with
-# Suricata alert logs, providing a compact, color-coded output
+# Suricata alert logs, providing a compact, one-line, color-coded output
 # for each IP that has generated an alert.
 #
 # Features:
@@ -11,7 +11,7 @@
 # - Searches for those IPs in the Suricata eve.json log.
 # - ONLY prints information for IPs that are found in the logs with an alert.
 # - Resolves IP addresses to hostnames.
-# - Provides a color-coded output for each alerting IP.
+# - Provides a color-coded, single-line output for each alerting IP.
 # - MODIFIED: Script now only sets default DROP policies on INPUT, FORWARD, and OUTPUT chains,
 #             without adding specific source IP-based DROP rules.
 # - MODIFIED: IPTables flush now occurs *only* when an IP triggers an alert and is about to trigger policy changes,
@@ -23,6 +23,7 @@
 # - NEW: Improved readability of the "skipping policy change" message by breaking it into multiple lines.
 # - NEW: Signatures are now printed on a new line for better readability in the alert report.
 # - UPDATED: "Skipping policy change" message formatted into two lines, with the last line in green.
+# - UPDATED: 'Test Mode' now allows the script to run continuously and apply DROP policies on ANY alert, not just high-priority ones.
 #
 
 use strict;
@@ -37,7 +38,12 @@ use open ':std', ':encoding(UTF-8)';
 
 # --- Configuration ---
 my $eve_json_path = '/var/log/suricata/eve.json';
-my $check_interval = 15; # Seconds to wait between checks
+my $check_interval = 5; # Seconds to wait between checks
+
+# --- NEW: TEST MODE CONFIGURATION ---
+# Set to 1 to bypass the high-priority alert requirement and apply policies on ANY alert.
+# The script will run continuously in either mode.
+my $enable_test_mode = 0; # !!! USE WITH CAUTION !!!
 
 # IPTABLES AUTO-BLOCKING CONFIGURATION (!!! DANGER ZONE !!!)
 my $enable_auto_blocking = 1; # Set to 1 to enable automatic iptables blocking
@@ -74,7 +80,13 @@ my $color_green    = color('bold green'); # Added for success messages
 while (1) {
     system('clear');
     print $color_cyan . "--- Suricata Live Alert Monitor | Running check at: " . localtime() . " ---\n" . $color_reset;
-    print $color_cyan . "--- Auto-Blocking (Policy Drop): " . ($enable_auto_blocking ? $color_red."ENABLED (Threshold: $BLOCKING_THRESHOLD, Priority 1/2)" : $color_green."DISABLED"). " ---" . $color_reset . "\n\n";
+
+    # Display the current mode and policy trigger condition
+    my $policy_trigger_condition = $enable_test_mode ? "ANY alert" : "Priority 1/2 alert";
+    if ($enable_test_mode) {
+        print $color_yellow . "--- TEST MODE ENABLED ---\n" . $color_reset;
+    }
+    print $color_cyan . "--- Auto-Blocking (Policy Drop): " . ($enable_auto_blocking ? $color_red."ENABLED (Threshold: $BLOCKING_THRESHOLD, On: $policy_trigger_condition)" : $color_green."DISABLED"). " ---" . $color_reset . "\n\n";
 
     # Get currently connected foreign IPs
     my $foreign_ips = get_foreign_ips();
@@ -225,15 +237,19 @@ sub apply_policies_and_report {
 
         # --- IPTABLES AUTO-POLICY CHANGE LOGIC ---
         if ($enable_auto_blocking) {
-            # Check if IP has met the threshold AND policies haven't been applied by us yet
-            # AND if a high-priority alert (1 or 2) has been detected for this IP
-            if ($total >= $BLOCKING_THRESHOLD && !$policy_applied_ips{$ip} && $data->{has_high_priority_alert}) {
-                print $color_red . ">>> POLICY CHANGE: IP $ip exceeded alert threshold ($total alerts) and has high-priority alert <<<\n" . $color_reset;
+            # Base condition: threshold met and policy not yet applied for this IP
+            my $base_condition_met = ($total >= $BLOCKING_THRESHOLD && !$policy_applied_ips{$ip});
+
+            # Mode-specific condition: In test mode, any alert is sufficient. In normal mode, high priority is required.
+            my $mode_condition_met = $enable_test_mode ? 1 : $data->{has_high_priority_alert};
+
+            if ($base_condition_met && $mode_condition_met) {
+                my $trigger_reason = $enable_test_mode
+                    ? "exceeded alert threshold in TEST MODE"
+                    : "exceeded alert threshold ($total alerts) and has high-priority alert";
+                print $color_red . ">>> POLICY CHANGE: IP $ip $trigger_reason <<<\n" . $color_reset;
 
                 # --- IPTABLES FLUSH AND DELETE CHAINS (DANGER ZONE!) ---
-                # This will clear ALL existing iptables rules in the filter, nat, and mangle tables.
-                # ONLY USE THIS IF YOU ARE CERTAIN NO OTHER SERVICES RELY ON PERSISTENT IPTABLES RULES.
-                # This block has been moved here to ensure flushing happens right before applying new policies.
                 print $color_yellow . "Flushing existing iptables rules for a clean slate before applying new policies...\n" . $color_reset;
                 run_iptables_command('-F');
                 run_iptables_command('-X');
@@ -265,7 +281,7 @@ sub apply_policies_and_report {
 
             } elsif ($policy_applied_ips{$ip}) {
                 print $color_white . "    Default policies already applied by script.\n" . $color_reset;
-            } elsif ($total >= $BLOCKING_THRESHOLD && !$data->{has_high_priority_alert}) {
+            } elsif ($base_condition_met && !$mode_condition_met) { # This case only happens in normal mode
                 # Formatted into two lines, with the last line in green
                 print $color_yellow . "    IP $ip met alert threshold ($total alerts). No high-priority (1 or 2) alert detected.\n" . $color_reset;
                 print $color_green . "    Skipping policy change.\n" . $color_reset;
